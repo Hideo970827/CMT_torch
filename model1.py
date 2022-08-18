@@ -109,6 +109,9 @@ class ChordConditionedMelodyTransformer(nn.Module):
             pitch_enc_result = self.pitch_forward(emb, attention_map, masking=False)
             pitch1_emb=pitch_enc_result['output']
             rhythm1_emb = self.rhythm1_emb(rhythm1)
+            rhythm1_emb = torch.cat([rhythm1_emb, chord_hidden[0], chord_hidden[1], pitch1_emb], -1)
+            ##hidden_dim?
+            rhythm1_emb *= torch.sqrt(torch.tensor(self.hidden_dim, dtype=torch.float))
 
 
             if attention_map:
