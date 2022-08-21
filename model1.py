@@ -23,7 +23,7 @@ class ChordConditionedMelodyTransformer(nn.Module):
         self.rhythm_emb_size = pitch_emb_size // 8
         self.pitch_emb_size = pitch_emb_size
         self.chord_hidden = 7 * (pitch_emb_size // 32)  # 2 * chord_hidden + rhythm_emb = rhythm_hidden
-        self.rhythm_hidden = 9 * (pitch_emb_size // 16)   # 2 * chord_hidden + rhythm_hidden = pitch_emb
+        self.rhythm_hidden = 9 * (pitch_emb_size // 16)  # 2 * chord_hidden + rhythm_hidden = pitch_emb
         self.hidden_dim = hidden_dim
 
         # embedding layer
@@ -52,14 +52,14 @@ class ChordConditionedMelodyTransformer(nn.Module):
             value_dim // 4,
             num_heads,
             self.max_len,
-            False,      # include succeeding elements' positional embedding also
+            False,  # include succeeding elements' positional embedding also
             layer_dropout,
             attention_dropout
         )
         self.rhythm_decoder = nn.ModuleList([
             SelfAttentionBlock(*rhythm_params) for _ in range(num_layers)
         ])
-        
+
         pitch_params = (
             2 * self.pitch_emb_size,
             self.hidden_dim,
@@ -67,12 +67,41 @@ class ChordConditionedMelodyTransformer(nn.Module):
             value_dim,
             num_heads,
             self.max_len,
-            True,       # preceding only
+            False,  # preceding only
             layer_dropout,
             attention_dropout
         )
         self.pitch_decoder = nn.ModuleList([
             SelfAttentionBlock(*pitch_params) for _ in range(num_layers)
+        ])
+
+        rhythm1_params = (
+            2*self.pitch_emb_size+self.rhythm_emb_size,
+            self.rhythm_hidden,
+            key_dim // 4,
+            value_dim // 4,
+            num_heads,
+            self.max_len,
+            False,  # include succeeding elements' positional embedding also
+            layer_dropout,
+            attention_dropout
+        )
+        self.rhythm1_decoder = nn.ModuleList([
+            SelfAttentionBlock(*rhythm1_params) for _ in range(num_layers)
+        ])
+        pitch1_params = (
+            3 * self.pitch_emb_size+self.rhythm_emb_size,
+            self.hidden_dim,
+            key_dim,
+            value_dim,
+            num_heads,
+            self.max_len,
+            True,  # preceding only
+            layer_dropout,
+            attention_dropout
+        )
+        self.pitch_decoder = nn.ModuleList([
+            SelfAttentionBlock(*pitch1_params) for _ in range(num_layers)
         ])
 
         # output layer
@@ -88,7 +117,7 @@ class ChordConditionedMelodyTransformer(nn.Module):
     # rhythm : time_len + 1   (input & target)
     # pitch : time_len      (input only)
     # chord : time_len + 1  (input & target)
-    def forward(self, rhythm, pitch, chord,rhythm1,pitch1, attention_map=False, rhythm_only=False,):
+    def forward(self, rhythm, pitch, chord, rhythm1, pitch1, attention_map=False, rhythm_only=False, ):
         # chord_hidden : time_len   (target timestep)
         chord_hidden = self.chord_forward(chord)
 
@@ -105,19 +134,39 @@ class ChordConditionedMelodyTransformer(nn.Module):
             emb *= torch.sqrt(torch.tensor(self.hidden_dim, dtype=torch.float))
             pitch_output = self.pitch_forward(emb, attention_map)
             result['pitch'] = pitch_output['output']
-
+#将pitch送入encoder模型 生成pitch的hidden
             pitch_enc_result = self.pitch_forward(emb, attention_map, masking=False)
-            pitch1_emb=pitch_enc_result['output']
+            pitch_hidd = pitch_enc_result['output']
+            #将rhythm1编码
             rhythm1_emb = self.rhythm1_emb(rhythm1)
-            rhythm1_emb = torch.cat([rhythm1_emb, chord_hidden[0], chord_hidden[1], pitch1_emb], -1)
-            ##hidden_dim?
-            rhythm1_emb *= torch.sqrt(torch.tensor(self.hidden_dim, dtype=torch.float))
+            rhythm1_emb = torch.cat([rhythm1_emb, chord_hidden[0], chord_hidden[1], rhythm_emb, pitch_hidd], -1)
+            rhythm1_emb *= torch.sqrt(torch.tensor(self.rhythm_hidden, dtype=torch.float))
+#将处理好的数据（包含rhythm1，chord信息，第一个rhythm信息，第一个pitch信息）放入decoder模型生成rhythm1
+            rhythm1_dec_result = self.rhythm1_forward(rhythm1_emb, attention_map, masking=True)
+            rhythm1_out = self.rhythm_outlayer(rhythm1_dec_result['output'])
+            rhythm1_out = self.log_softmax(rhythm1_out)
+            result = {'rhythm1': rhythm1_out}
+
+            rhythm1_enc_result=self.rhythm1_forward(rhythm1_emb,attention_map,masking=False)
+            rhythm1_hidd=rhythm1_enc_result['output']
+            pitch1_emb=self.pitch1_emb(pitch1)
+            pitch1_emb=torch.cat([pitch1_emb,chord_hidden[0], chord_hidden[1], rhythm_emb, pitch_hidd,rhythm1_hidd], -1)
+            pitch1_emb *= torch.sqrt(torch.tensor(self.hidden_dim, dtype=torch.float))
+            pitch1_output=self.pitch1_forward(pitch1_emb,attention_map)
+            result['pitch1'] = pitch1_output['output']
 
 
             if attention_map:
                 result['weights_rdec'] = rhythm_dec_result['weights']
                 result['weights_renc'] = rhythm_enc_result['weights']
-                result['weights_pitch'] = pitch_output['weights']
+                #这里把weights_pitch修改成weights_pdec
+                result['weights_pdec'] = pitch_output['weights']
+                result['weights_penc'] = pitch_enc_result['weights']
+                result['weights_r1dec'] = rhythm1_dec_result['weights']
+                result['weights_r1enc'] = rhythm1_enc_result['weights']
+                result['weights_p1dec'] = pitch1_output['weights']
+
+
         return result
 
     def chord_forward(self, chord):
@@ -130,25 +179,25 @@ class ChordConditionedMelodyTransformer(nn.Module):
         chord_for = chord_out[:, 1:, :self.chord_hidden]
         chord_back = chord_out[:, 1:, self.chord_hidden:]
         return chord_for, chord_back
-    
+
     def rhythm_forward(self, rhythm, chord_hidden, attention_map=False, masking=True):
         rhythm_emb = self.rhythm_emb(rhythm)
         rhythm_emb = torch.cat([rhythm_emb, chord_hidden[0], chord_hidden[1]], -1)
         rhythm_emb *= torch.sqrt(torch.tensor(self.rhythm_hidden, dtype=torch.float))
         rhythm_emb = self.rhythm_pos_enc(rhythm_emb)
         rhythm_emb = self.emb_dropout(rhythm_emb)
-        
+
         weights = []
         for _, layer in enumerate(self.rhythm_decoder):
             result = layer(rhythm_emb, attention_map, masking)
             rhythm_emb = result['output']
             if attention_map:
-                weights.append(result['weight']) 
-        
+                weights.append(result['weight'])
+
         result = {'output': rhythm_emb}
         if attention_map:
             result['weights'] = weights
-        
+
         return result
 
     def pitch_forward(self, pitch_emb, attention_map=False, masking=True):
@@ -166,11 +215,55 @@ class ChordConditionedMelodyTransformer(nn.Module):
         # output layer
         output = self.pitch_outlayer(emb)
         output = self.log_softmax(output)
-        
+
         result = {'output': output}
         if attention_map:
             result['weights'] = pitch_weights
-        
+
+        return result
+
+    def rhythm1_forward(self, rhythm1_emb, attention_map=False, masking=True):
+        emb = self.pos_encoding(rhythm1_emb)
+        emb = self.emb_dropout(emb)
+
+        # rhythm1 model
+        rhythm1_weights = []
+        for _, layer in enumerate(self.rhythm1_decoder):
+            rhythm1_result = layer(emb, attention_map, masking)
+            emb = rhythm1_result['output']
+            if attention_map:
+                rhythm1_weights.append(rhythm1_result['weight'])
+
+        # output layer
+        output = self.rhythm_outlayer(emb)
+        output = self.log_softmax(output)
+
+        result = {'output': output}
+        if attention_map:
+            result['weights'] = rhythm1_weights
+
+        return result
+
+    def pitch1_forward(self, pitch_emb, attention_map=False, masking=True):
+        emb = self.pos_encoding(pitch_emb)
+        emb = self.emb_dropout(emb)
+
+        # pitch model
+        pitch_weights = []
+        for _, layer in enumerate(self.pitch1_decoder):
+            pitch_result = layer(emb, attention_map, masking)
+            emb = pitch_result['output']
+            if attention_map:
+                pitch_weights.append(pitch_result['weight'])
+
+        # output layer
+        output = self.pitch_outlayer(emb)
+        output = self.log_softmax(output)
+
+        result = {'output': output}
+        if attention_map:
+            result['weights'] = pitch_weights
+
         return result
 
     def sampling(self, prime_rhythm, prime_pitch, chord, topk=None, attention_map=False):
